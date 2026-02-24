@@ -4,24 +4,24 @@ from datetime import datetime
 from flask import Flask
 from threading import Thread
 
-# Render-даги Environment Variable-дан токенни оламиз
+# ТОКЕННИ RENDER-ДА BOT_TOKEN ДЕБ КИРИТИНГ
 TOKEN = os.getenv('BOT_TOKEN')
 bot = telebot.TeleBot(TOKEN)
 app = Flask('')
 
-# --- 1. БАЗАНИ ТЎЛИҚ СОЗЛАШ ---
+# --- БАЗАНИ СОЗЛАШ ---
 def init_db():
-    conn = sqlite3.connect('aktiv_pro.db', check_same_thread=False)
+    conn = sqlite3.connect('smart_fin_pro.db', check_same_thread=False)
     cursor = conn.cursor()
     cursor.execute('''CREATE TABLE IF NOT EXISTS finance 
-        (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, type TEXT, 
-         category TEXT, amount REAL, currency TEXT, date TEXT)''')
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, type TEXT, category TEXT, amount REAL, currency TEXT, date TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS communal 
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, type TEXT, amount REAL, currency TEXT, date TEXT)''')
     cursor.execute('''CREATE TABLE IF NOT EXISTS debts 
-        (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, d_type TEXT, 
-         name TEXT, amount REAL, currency TEXT, status TEXT)''')
+        (id INTEGER PRIMARY KEY AUTOINCREMENT, uid INTEGER, d_type TEXT, name TEXT, amount REAL, currency TEXT)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS settings (uid INTEGER PRIMARY KEY, main_cur TEXT)''')
     conn.commit(); conn.close()
 
-# --- 2. МБ КУРСЛАРИНИ ОЛИШ ---
 def get_rates():
     rates = {'UZS': 1.0, 'USD': 12850.0, 'RUB': 145.0, 'CNY': 1800.0}
     try:
@@ -31,133 +31,187 @@ def get_rates():
     except: pass
     return rates
 
-# --- 3. 1-9 ИНЛАЙН КЛАВИАТУРА ---
-def get_amount_keyboard(action, current_val=""):
-    markup = types.InlineKeyboardMarkup(row_width=3)
-    btns = [types.InlineKeyboardButton(str(i), callback_data=f"num_{action}_{current_val}{i}") for i in range(1, 10)]
-    markup.add(*btns)
-    markup.add(types.InlineKeyboardButton("0", callback_data=f"num_{action}_{current_val}0"),
-               types.InlineKeyboardButton("⬅️", callback_data=f"num_{action}_{current_val[:-1]}"),
-               types.InlineKeyboardButton("🗑", callback_data=f"num_{action}_"))
-    if current_val:
-        markup.add(types.InlineKeyboardButton(f"✅ Тасдиқлаш: {current_val}", callback_data=f"confirm_{action}_{current_val}"))
-    return markup
+def get_main_cur(uid):
+    conn = sqlite3.connect('smart_fin_pro.db'); c = conn.cursor()
+    c.execute("SELECT main_cur FROM settings WHERE uid=?", (uid,))
+    res = c.fetchone()
+    conn.close()
+    return res[0] if res else "UZS"
 
-# --- 4. АСОСИЙ МЕНЮ (10 ТА ТУГМА) ---
+# --- МЕНЮЛАР ---
 def main_menu():
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
-    markup.row("💸 Харажат", "💰 Даромад")
-    markup.add("📊 Статистика", "📅 Ойлик харажат")
-    markup.row("🔍 Кунлик ҳисобот")
-    markup.row("🤝 Олди-берди")
-    markup.row("🏠 Коммунал")
-    markup.row("📊 Коммунал Ҳисобот")
-    markup.row("⚙️ Валюта танлаш")
-    markup.row("📈 Жонли Валюта ва Конвертер")
-    return markup
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.row("💸 Харажат", "💰 Даромад")
+    m.row("📊 Статистика")
+    m.row("📅 Ойлик харажат", "🔍 Кунлик ҳисобот")
+    m.row("🤝 Олди-берди", "🏠 Коммунал")
+    m.row("📈 Валюта ва Конвертер")
+    return m
 
-user_view_cur = {} 
+def communal_menu():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.row("➕ Ҳисоб қўшиш", "📊 Коммунал Ҳисобот")
+    m.row("⬅️ Ортга")
+    return m
 
+def debt_menu():
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=1)
+    m.row("🟢 Ҳаққим бор", "🔴 Қарздорман")
+    m.row("📜 Кимда нимам бор")
+    m.row("💰 Қарзни қайтариш")
+    m.row("⬅️ Ортга")
+    return m
+
+# --- АСОСИЙ ФУНКЦИЯЛАР ---
 @bot.message_handler(commands=['start'])
 def start(message):
     init_db()
-    user_view_cur[message.chat.id] = "UZS"
-    bot.send_message(message.chat.id, "🚀 **Aktiv PRO** тизимига хуш келибсиз!", reply_markup=main_menu())
+    bot.send_message(message.chat.id, "🚀 Aktiv PRO фаол! Шартлар асосида созланди.", reply_markup=main_menu())
 
-# --- 5. КИРИТИШ (АВВАЛ СУММА) ---
-@bot.message_handler(func=lambda m: m.text in ["💸 Харажат", "💰 Даромад", "🤝 Олди-берди", "🏠 Коммунал"])
-def handle_entry_start(message):
-    act_map = {"💸 Харажат":"exp", "💰 Даромад":"inc", "🤝 Олди-берди":"debt", "🏠 Коммунал":"com"}
-    action = act_map[message.text]
-    bot.send_message(message.chat.id, f"🔢 {message.text} суммасини киритинг:", reply_markup=get_amount_keyboard(action))
+# --- ХАРАЖАТ / ДАРОМАД (АВВАЛ КАТЕГОРИЯ) ---
+@bot.message_handler(func=lambda m: m.text in ["💸 Харажат", "💰 Даромад"])
+def fin_start(message):
+    action = "exp" if "Харажат" in message.text else "inc"
+    msg = bot.send_message(message.chat.id, "Категорияни киритинг (Масалан: Овқат, Ойлик):")
+    bot.register_next_step_handler(msg, lambda m: ask_fin_amt(m, action))
 
-# --- 6. ҲИСОБОТЛАР (БАТАФСИЛ) ---
-@bot.message_handler(func=lambda m: m.text in ["📊 Статистика", "📅 Ойлик харажат", "🔍 Кунлик ҳисобот", "📊 Коммунал Ҳисобот"])
-def handle_reports(message):
-    conn = sqlite3.connect('aktiv_pro.db'); cursor = conn.cursor()
-    v_cur = user_view_cur.get(message.chat.id, "UZS")
-    r = get_rates()
+def ask_fin_amt(message, action):
+    cat = message.text if message.text else "Бошқа"
+    msg = bot.send_message(message.chat.id, f"[{cat}] суммасини ёзинг:")
+    bot.register_next_step_handler(msg, lambda m: ask_fin_cur(m, action, cat))
 
-    if message.text == "📊 Статистика":
-        cursor.execute("SELECT type, amount, currency FROM finance WHERE uid=?", (message.chat.id,))
-        rows = cursor.fetchall(); total = 0
-        for t, a, c in rows:
-            val = (a * r.get(c, 1)) / r.get(v_cur, 1)
-            total += val if t == "inc" else -val
-        bot.send_message(message.chat.id, f"⚖️ Умумий қолдиқ: {total:,.2f} {v_cur}")
-    else:
-        cursor.execute("SELECT DISTINCT strftime('%Y-%m', date) FROM finance WHERE uid=? ORDER BY date DESC", (message.chat.id,))
-        months = cursor.fetchall()
-        if not months: return bot.send_message(message.chat.id, "Ҳозирча маълумот йўқ.")
+def ask_fin_cur(message, action, cat):
+    try:
+        amt = float(message.text)
         m = types.InlineKeyboardMarkup()
-        pfx = "mon" if "Ойлик" in message.text else "day" if "Кунлик" in message.text else "comrep"
-        for mon in months:
-            m.add(types.InlineKeyboardButton(f"📅 {mon[0]}", callback_data=f"{pfx}_{mon[0]}"))
-        bot.send_message(message.chat.id, "Ойни танланг:", reply_markup=m)
-    conn.close()
+        for c in ["UZS", "USD", "RUB", "CNY"]:
+            m.add(types.InlineKeyboardButton(c, callback_data=f"f_{action}_{cat}_{amt}_{c}"))
+        bot.send_message(message.chat.id, "Валютани танланг:", reply_markup=m)
+    except: bot.send_message(message.chat.id, "Хато! Фақат сон ёзинг.")
 
-# --- 7. ВАЛЮТА ВА КУРС ---
-@bot.message_handler(func=lambda m: m.text == "⚙️ Валюта танлаш")
-def set_currency_view(message):
-    m = types.InlineKeyboardMarkup()
-    for c in ["UZS", "USD", "RUB", "CNY"]:
-        m.add(types.InlineKeyboardButton(c, callback_data=f"setcur_{c}"))
-    bot.send_message(message.chat.id, "Ҳисоботлар қайси валютада кўрсатилсин?", reply_markup=m)
+# --- КОММУНАЛ ---
+@bot.message_handler(func=lambda m: m.text == "🏠 Коммунал")
+def comm_main(message):
+    bot.send_message(message.chat.id, "🏠 Коммунал бўлими:", reply_markup=communal_menu())
 
-@bot.message_handler(func=lambda m: m.text == "📈 Жонли Валюта ва Конвертер")
-def live_currency(message):
-    r = get_rates()
-    text = f"🏦 МБ Курслари:\n🇺🇿 1 USD = {r['USD']} UZS\n🇷🇺 1 RUB = {r['RUB']} UZS\n🇨🇳 1 CNY = {r['CNY']} UZS\n\nКонвертер учун валютани танланг:"
-    m = types.InlineKeyboardMarkup(row_width=2)
-    for c in ["USD", "RUB", "CNY"]:
-        m.add(types.InlineKeyboardButton(f"🔄 {c}", callback_data=f"calc_{c}"))
-    m.add(types.InlineKeyboardButton("⬅️ Ортга", callback_data="back_main"))
-    bot.send_message(message.chat.id, text, reply_markup=m)
+@bot.message_handler(func=lambda m: m.text == "➕ Ҳисоб қўшиш")
+def comm_add(message):
+    m = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    m.add("⚡️ Свет", "🔥 Газ", "💧 Сув", "🗑 Чиқинди", "🏢 Уй солиғи", "🌱 Ер солиғи", "⬅️ Ортга")
+    msg = bot.send_message(message.chat.id, "Тўлов турини танланг:", reply_markup=m)
+    bot.register_next_step_handler(msg, lambda m: ask_c_amt(m))
 
-# --- 8. CALLBACKS ---
+def ask_c_amt(message):
+    if message.text == "⬅️ Ортга": return comm_main(message)
+    t = message.text
+    msg = bot.send_message(message.chat.id, f"[{t}] суммасини ёзинг:")
+    bot.register_next_step_handler(msg, lambda m: ask_c_cur(m, t))
+
+def ask_c_cur(message, t):
+    try:
+        amt = float(message.text)
+        m = types.InlineKeyboardMarkup()
+        for c in ["UZS", "USD", "RUB", "CNY"]:
+            m.add(types.InlineKeyboardButton(c, callback_data=f"c_{t}_{amt}_{c}"))
+        bot.send_message(message.chat.id, "Валютани танланг:", reply_markup=m)
+    except: bot.send_message(message.chat.id, "Хато!")
+
+# --- ВАЛЮТА ВА КОНВЕРТЕР ---
+@bot.message_handler(func=lambda m: m.text == "📈 Валюта ва Конвертер")
+def cur_section(message):
+    m = types.InlineKeyboardMarkup(row_width=1)
+    m.add(
+        types.InlineKeyboardButton("⚙️ Валюта танлаш (Асосий)", callback_data="set_cur"),
+        types.InlineKeyboardButton("📈 Курслар ва Конвертер", callback_data="conv_menu")
+    )
+    bot.send_message(message.chat.id, "📈 Валюта бўлими:", reply_markup=m)
+
+# --- ОЛДИ-БЕРДИ (5 ТА ТУГМА) ---
+@bot.message_handler(func=lambda m: m.text == "🤝 Олди-берди")
+def debt_section(message):
+    bot.send_message(message.chat.id, "🤝 Олди-берди панели:", reply_markup=debt_menu())
+
+@bot.message_handler(func=lambda m: m.text in ["🟢 Ҳаққим бор", "🔴 Қарздорман"])
+def debt_add(message):
+    d_type = "plus" if "Ҳаққим" in message.text else "minus"
+    msg = bot.send_message(message.chat.id, "Исмни ёзинг:")
+    bot.register_next_step_handler(msg, lambda m: ask_d_amt(m, d_type))
+
+def ask_d_amt(message, d_type):
+    name = message.text
+    msg = bot.send_message(message.chat.id, f"{name} учун суммани ёзинг:")
+    bot.register_next_step_handler(msg, lambda m: ask_d_cur(m, d_type, name))
+
+def ask_d_cur(message, d_type, name):
+    try:
+        amt = float(message.text)
+        m = types.InlineKeyboardMarkup()
+        for c in ["UZS", "USD", "RUB", "CNY"]:
+            m.add(types.InlineKeyboardButton(c, callback_data=f"d_{d_type}_{name}_{amt}_{c}"))
+        bot.send_message(message.chat.id, "Валюта:", reply_markup=m)
+    except: bot.send_message(message.chat.id, "Хато!")
+
+@bot.message_handler(func=lambda m: m.text == "📜 Кимда нимам бор")
+def debt_list(message):
+    conn = sqlite3.connect('smart_fin_pro.db'); c = conn.cursor()
+    c.execute("SELECT d_type, name, amount, currency FROM debts WHERE uid=?", (message.chat.id,))
+    rows = c.fetchall()
+    if not rows: return bot.send_message(message.chat.id, "Рўйхат бўш.")
+    res = "📜 Қарзлар рўйхати:\n\n"
+    for t, n, a, cur in rows:
+        icon = "🟢" if t == "plus" else "🔴"
+        res += f"{icon} {n}: {a:,.2f} {cur}\n"
+    bot.send_message(message.chat.id, res)
+
+# --- CALLBACKS ---
 @bot.callback_query_handler(func=lambda call: True)
-def handle_calls(call):
+def calls(call):
     d = call.data.split('_')
     r = get_rates()
-    v_cur = user_view_cur.get(call.message.chat.id, "UZS")
+    conn = sqlite3.connect('smart_fin_pro.db'); cur = conn.cursor()
 
-    if d[0] == 'num':
-        bot.edit_message_reply_markup(call.message.chat.id, call.message.message_id, reply_markup=get_amount_keyboard(d[1], d[2]))
-    elif d[0] == 'confirm':
-        msg_text = "Энди категорияни ёзинг (Масалан: Бензин, Свет):"
-        msg = bot.send_message(call.message.chat.id, f"💰 Сумма: {d[2]}\n\n{msg_text}")
-        bot.register_next_step_handler(msg, lambda m: ask_save_currency(m, d[1], d[2]))
-    elif d[0] == 'save':
-        conn = sqlite3.connect('aktiv_pro.db'); cursor = conn.cursor()
-        date_now = datetime.now().strftime("%Y-%m-%d")
-        cursor.execute("INSERT INTO finance (uid, type, category, amount, currency, date) VALUES (?,?,?,?,?,?)",
-                       (call.message.chat.id, d[1], d[2], float(d[3]), d[4], date_now))
-        conn.commit(); conn.close()
-        bot.send_message(call.message.chat.id, f"✅ Сақланди: {d[2]} - {d[3]} {d[4]}")
-    elif d[0] == 'mon':
-        conn = sqlite3.connect('aktiv_pro.db'); cursor = conn.cursor()
-        cursor.execute("SELECT amount, currency FROM finance WHERE uid=? AND date LIKE ? AND type IN ('exp','com')", (call.message.chat.id, f"{d[1]}%"))
-        rows = cursor.fetchall(); total = sum((a * r.get(c, 1)) / r.get(v_cur, 1) for a, c in rows)
-        bot.send_message(call.message.chat.id, f"📅 {d[1]} жами харажат: {total:,.2f} {v_cur}")
-    elif d[0] == 'setcur':
-        user_view_cur[call.message.chat.id] = d[1]
-        bot.send_message(call.message.chat.id, f"✅ Ҳисоботлар энди {d[1]}да.")
-    elif d[0] == 'back' and d[1] == 'main':
-        bot.send_message(call.message.chat.id, "Асосий меню:", reply_markup=main_menu())
+    if d[0] == 'f': # Finance
+        cur.execute("INSERT INTO finance (uid, type, category, amount, currency, date) VALUES (?,?,?,?,?,?)",
+                   (call.message.chat.id, d[1], d[2], float(d[3]), d[4], datetime.now().strftime("%Y-%m-%d")))
+        conn.commit(); bot.send_message(call.message.chat.id, "✅ Сақланди!")
 
-def ask_save_currency(message, action, amount):
-    cat = message.text
-    m = types.InlineKeyboardMarkup()
-    for c in ["UZS", "USD", "RUB", "CNY"]:
-        m.add(types.InlineKeyboardButton(c, callback_data=f"save_{action}_{cat}_{amount}_{c}"))
-    bot.send_message(message.chat.id, f"Категория: {cat}\nВалютани танланг:", reply_markup=m)
+    elif d[0] == 'c': # Communal
+        cur.execute("INSERT INTO communal (uid, type, amount, currency, date) VALUES (?,?,?,?,?)",
+                   (call.message.chat.id, d[1], float(d[2]), d[3], datetime.now().strftime("%Y-%m-%d")))
+        conn.commit(); bot.send_message(call.message.chat.id, "✅ Коммунал сақланди!")
 
-# Render учун Keep-Alive
+    elif d[0] == 'd': # Debts
+        cur.execute("INSERT INTO debts (uid, d_type, name, amount, currency) VALUES (?,?,?,?,?)",
+                   (call.message.chat.id, d[1], d[2], float(d[3]), d[4]))
+        conn.commit(); bot.send_message(call.message.chat.id, "✅ Қарз рўйхатга олинди!")
+
+    elif d[0] == 'conv' and d[1] == 'menu':
+        txt = f"🏦 Курслар:\n1 USD = {r['USD']} UZS\n1 RUB = {r['RUB']} UZS\n\nСуммани чақиш учун ёзинг (Масалан: 100 USD):"
+        bot.send_message(call.message.chat.id, txt)
+
+    conn.close()
+
+# --- СТАТИСТИКА (ФОЙДА/ЗАРАР) ---
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def stats(message):
+    r = get_rates(); m_c = get_main_cur(message.chat.id)
+    conn = sqlite3.connect('smart_fin_pro.db'); c = conn.cursor()
+    c.execute("SELECT type, amount, currency FROM finance WHERE uid=?", (message.chat.id,))
+    data = c.fetchall()
+    inc = sum((a * r[cur]) / r[m_c] for t, a, cur in data if t == 'inc')
+    exp = sum((a * r[cur]) / r[m_c] for t, a, cur in data if t == 'exp')
+    bot.send_message(message.chat.id, f"📊 Статистика ({m_c}):\n💰 Даромад: {inc:,.2f}\n💸 Харажат: {exp:,.2f}\n⚖️ Натижа: {inc-exp:,.2f}")
+
+# --- ОРТГА ---
+@bot.message_handler(func=lambda m: m.text == "⬅️ Ортга")
+def back(message):
+    bot.send_message(message.chat.id, "Асосий меню:", reply_markup=main_menu())
+
+# RENDER WEB SERVER
 @app.route('/')
 def home(): return "OK"
-def run(): app.run(host='0.0.0.0', port=10000)
 
 if __name__ == "__main__":
     init_db()
-    Thread(target=run).start()
+    Thread(target=lambda: app.run(host='0.0.0.0', port=10000)).start()
     bot.polling(none_stop=True)
