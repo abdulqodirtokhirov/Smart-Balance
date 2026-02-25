@@ -11,13 +11,10 @@ logging.basicConfig(level=logging.INFO)
 def init_db():
     conn = sqlite3.connect('smart_balance_final.db', check_same_thread=False)
     cursor = conn.cursor()
-    # Молиявий транзакциялар
     cursor.execute('''CREATE TABLE IF NOT EXISTS finance 
         (uid INTEGER, type TEXT, cat TEXT, amt REAL, cur TEXT, date TEXT)''')
-    # Коммунал ва солиқлар
     cursor.execute('''CREATE TABLE IF NOT EXISTS communal 
         (uid INTEGER, type TEXT, amt REAL, cur TEXT, date TEXT)''')
-    # Қарзлар рўйхати
     cursor.execute('''CREATE TABLE IF NOT EXISTS debts 
         (uid INTEGER, d_type TEXT, name TEXT, amt REAL, cur TEXT)''')
     conn.commit()
@@ -42,17 +39,28 @@ def main_menu():
           "🔍 Кунлик ҳисобот", "🤝 Олди-берди", "🏠 Коммунал", "📈 Валюта/Конвертер")
     return m
 
+# Асосий менюни Инлайн кўриниши
+def inline_main_menu():
+    m = types.InlineKeyboardMarkup(row_width=2)
+    m.add(
+        types.InlineKeyboardButton("💸 Харажат", callback_data="menu_exp"),
+        types.InlineKeyboardButton("💰 Даромад", callback_data="menu_inc"),
+        types.InlineKeyboardButton("📊 Статистика", callback_data="menu_stats"),
+        types.InlineKeyboardButton("📅 Ойлик", callback_data="menu_month")
+    )
+    return m
+
 @bot.message_handler(commands=['start'])
 def start_cmd(message):
     init_db()
-    bot.send_message(message.chat.id, "🌟 **Smart Balance** тизимига хуш келибсиз!\n\nБарча 8 та функция тақдимот учун тўлиқ тайёр.", 
+    bot.send_message(message.chat.id, "🌟 **Smart Balance** тизимига хуш келибсиз!\n\nКеракли бўлимни танланг:", 
                      reply_markup=main_menu(), parse_mode="Markdown")
+    bot.send_message(message.chat.id, "Тезкор меню:", reply_markup=inline_main_menu())
 
 # --- 5. 💸 ХАРАЖАТ ВА 💰 ДАРОМАД (ТЎЛИҚ МАНТИҚ) ---
 @bot.message_handler(func=lambda m: m.text in ["💸 Харажат", "💰 Даромад"])
 def finance_init(message):
     act = "exp" if "Харажат" in message.text else "inc"
-    text = "чиқим (харажат)" if act == "exp" else "кирим (даромад)"
     msg = bot.send_message(message.chat.id, f"📝 **{message.text}** бўлими.\n\nСумма ва мақсадни ёзинг.\n💡 *Мисол:* `Обед 50000` ёки `Ойлик 500`", parse_mode="Markdown")
     bot.register_next_step_handler(msg, lambda m: finance_process(m, act))
 
@@ -74,10 +82,9 @@ def finance_process(message, act):
     bot.send_message(message.chat.id, f"📌 Категория: {cat}\n💰 Сумма: {amt:,.0f}\n\nВалютани танланг:", reply_markup=m)
 
 # --- 6. 📊 СТАТИСТИКА (АНИҚ ҲИСОБ-КИТОБ) ---
-@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
-def statistics_view(message):
+def get_stats_text(uid):
     conn = sqlite3.connect('smart_balance_final.db'); c = conn.cursor()
-    c.execute("SELECT type, amt, cur FROM finance WHERE uid=?", (message.chat.id,))
+    c.execute("SELECT type, amt, cur FROM finance WHERE uid=?", (uid,))
     rows = c.fetchall()
     r = get_rates(); inc, exp = 0.0, 0.0
     
@@ -85,13 +92,16 @@ def statistics_view(message):
         val = a * r.get(cur, 1.0)
         if t == "inc": inc += val
         else: exp += val
-    
-    res = (f"📊 **Умумий Ҳисобот:**\n━━━━━━━━━━━━━━\n"
-           f"💰 Жами Даромад: {inc:,.0f} UZS\n"
-           f"💸 Жами Харажат: {exp:,.0f} UZS\n━━━━━━━━━━━━━━\n"
-           f"⚖️ Соф Фойда: {inc-exp:,.0f} UZS")
-    bot.send_message(message.chat.id, res, parse_mode="Markdown")
     conn.close()
+    
+    return (f"📊 **Сизнинг умумий статистикангиз:**\n━━━━━━━━━━━━━━\n"
+            f"💰 Жами Даромад: {inc:,.0f} UZS\n💸 Жами Харажат: {exp:,.0f} UZS\n━━━━━━━━━━━━━━\n"
+            f"⚖️ Соф Фойда: {inc-exp:,.0f} UZS")
+
+@bot.message_handler(func=lambda m: m.text == "📊 Статистика")
+def statistics_view(message):
+    text = get_stats_text(message.chat.id)
+    bot.send_message(message.chat.id, text, reply_markup=inline_main_menu(), parse_mode="Markdown")
 
 # --- 7. 📅 ОЙЛИК ХАРАЖАТ (ОЙЛАР БЎЙИЧА ФИЛТР) ---
 @bot.message_handler(func=lambda m: m.text == "📅 Ойлик харажат")
@@ -223,33 +233,60 @@ def quick_calc(message):
         res = float(nums[0]) * r[cur]
         bot.reply_to(message, f"🔄 {nums[0]} {cur} = {res:,.0f} UZS")
 
-# --- 12. CALLBACK ҲАММА ТУГМАЛАР УЧУН (САҚЛАШ) ---
+# --- 12. CALLBACK ҲАММА ТУГМАЛАР УЧУН (САҚЛАШ, EDIT ВА SHOW ALERT) ---
 @bot.callback_query_handler(func=lambda call: True)
 def universal_callback(call):
     d = call.data.split('_')
     conn = sqlite3.connect('smart_balance_final.db'); c = conn.cursor()
-    
-    if d[0] == "sf": # Харажат/Даромад
+    alert_text = ""
+
+    # А) ИНЛАЙН МЕНЮДАН КЕЛГАНЛАР (1-коднинг "edit_message_text" мантиғи)
+    if d[0] == "menu":
+        if d[1] == "stats":
+            msg_text = get_stats_text(call.message.chat.id)
+            bot.edit_message_text(msg_text, call.message.chat.id, call.message.message_id, reply_markup=inline_main_menu(), parse_mode="Markdown")
+            alert_text = "📊 Статистика янгиланди!"
+        elif d[1] == "exp":
+            bot.send_message(call.message.chat.id, "💸 Харажат суммасини ёзинг (Мисол: Обед 50000):")
+            alert_text = "💸 Харажат бўлими"
+        elif d[1] == "inc":
+            bot.send_message(call.message.chat.id, "💰 Даромад суммасини ёзинг (Мисол: Ойлик 1000):")
+            alert_text = "💰 Даромад бўлими"
+        elif d[1] == "month":
+            month_report_start(call.message)
+            alert_text = "📅 Ойлик бўлими очилмоқда"
+
+    # Б) САҚЛАШЛАР ВА ОЙНАЛАР (2-коднинг чиройли шартлари)
+    elif d[0] == "sf": # Харажат/Даромад сақлаш
         c.execute("INSERT INTO finance VALUES (?,?,?,?,?,?)", (call.message.chat.id, d[1], d[2], d[3], d[4], datetime.now().strftime("%Y-%m-%d")))
         bot.edit_message_text(f"✅ Сақланди: {d[2]} ({d[3]} {d[4]})", call.message.chat.id, call.message.message_id)
+        alert_text = "✅ Пул муваффақиятли сақланди!"
         
-    elif d[0] == "sd": # Олди-берди
+    elif d[0] == "sd": # Олди-бердини сақлаш
         c.execute("INSERT INTO debts VALUES (?,?,?,?,?)", (call.message.chat.id, d[1], d[2], d[3], d[4]))
         bot.edit_message_text(f"🤝 Қарз рўйхатга олинди: {d[2]} ({d[3]} {d[4]})", call.message.chat.id, call.message.message_id)
+        alert_text = "✅ Олди-берди муваффақиятли сақланди!"
 
-    elif d[0] == "sc": # Коммунал
+    elif d[0] == "sc": # Коммунални сақлаш
         c.execute("INSERT INTO communal VALUES (?,?,?,?,?)", (call.message.chat.id, d[1], d[2], d[3], datetime.now().strftime("%Y-%m-%d")))
-        bot.edit_message_text(f"🏠 Коммунал тўлов сақланди: {d[1]} ({d[2]} {d[3]})", call.message.chat.id, call.message.message_id)
+        bot.edit_message_text(f"🏠 Тўлов сақланди: {d[1]} ({d[2]} {d[3]})", call.message.chat.id, call.message.message_id)
+        alert_text = "✅ Коммунал тўлов муваффақиятли сақланди!"
 
-    elif d[0] == "viewmon": # Ойлик Ҳисобот Детали
+    elif d[0] == "viewmon": # ОЙЛИК ҲИСОБОТ (Edit билан)
         c.execute("SELECT cat, SUM(amt), cur FROM finance WHERE uid=? AND type='exp' AND date LIKE ? GROUP BY cat, cur", (call.message.chat.id, f"{d[1]}%"))
         rows = c.fetchall()
         txt = f"📅 **{d[1]} ойи бўйича харажатлар:**\n\n"
         for ct, am, cr in rows: txt += f"🔸 {ct}: {am:,.0f} {cr}\n"
-        bot.send_message(call.message.chat.id, txt if rows else "Маълумот йўқ.")
+        bot.edit_message_text(txt if rows else "📭 Бу ойда маълумот йўқ.", call.message.chat.id, call.message.message_id)
+        alert_text = "✅ Ойлик ҳисобот тайёр!"
 
     conn.commit(); conn.close()
-    bot.answer_callback_query(call.id)
+
+    # Alert чиқариш механизми
+    if alert_text:
+        bot.answer_callback_query(call.id, text=alert_text, show_alert=True)
+    else:
+        bot.answer_callback_query(call.id)
 
 @bot.message_handler(func=lambda m: m.text == "⬅️ Ортга")
 def back_home(message):
